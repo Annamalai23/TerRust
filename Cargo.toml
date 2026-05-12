@@ -1,0 +1,105 @@
+[package]
+name = "terrust"
+version = "0.1.0"
+edition = "2021"
+authors = ["TerRust Team"]
+description = "Next-generation terminal environment with AI assistance"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["terminal", "cli", "ai", "productivity", "shell"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# Terminal I/O
+crossterm = { version = "0.27", features = ["event-stream", "events", "filedescriptor"] }
+nix = { version = "0.28", features = ["fs", "process", "signal", "user", "term"] }
+libc = "0.2"
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+tokio-stream = { version = "0.1", optional = true }
+
+# UI
+ratatui = { version = "0.25", features = ["all-widgets", "crossterm"] }
+syntect = { version = "5.0", features = ["default-fancy"] }
+pulldown-cmark = { version = "0.9", features = ["simd"] }
+unicode-width = "0.1"
+
+# HTTP and JSON
+reqwest = { version = "0.11", features = ["json", "stream", "rustls-tls"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", optional = true }
+
+# Configuration
+toml = "0.8"
+directories = "5.0"
+
+# Plugin system
+libloading = { version = "0.8", optional = true }
+
+# AI and NLP
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Clipboard
+arboard = { version = "3.0", optional = true }
+copypasta = { version = "0.10", optional = true }
+
+# Time and async
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+pin-project = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUID for session management
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# Command line parsing
+clap = { version = "4.0", features = ["derive"] }
+
+# For ANSI parsing
+ansi-parser = "0.9"
+
+# For path manipulation
+pathdiff = "0.2"
+
+[dev-dependencies]
+# Testing
+criterion = "0.5"
+trycmd = "0.15"
+
+# Mocking
+mockall = "0.12"
+
+# Assertions
+assert_cmd = "2.0"
+predicates = "3.0"
+
+# Temp files
+tempfile = "3.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = false
+
+
+
+[features]
+default = ["all"]
+all = ["ai", "plugins", "clipboard"]
+ai = ["reqwest", "tokio-stream", "serde_json"]
+plugins = ["libloading"]
+clipboard = ["arboard"]
+
+[workspace]

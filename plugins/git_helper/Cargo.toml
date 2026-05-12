@@ -1,0 +1,21 @@
+[package]
+name = "terrust-git-helper"
+version = "0.1.0"
+edition = "2021"
+authors = ["TerRust Team"]
+description = "Git integration plugin for TerRust"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "git_helper"
+crate-type = ["cdylib"]
+
+[dependencies]
+# For git operations
+libgit2 = { version = "0.18", default-features = false }
+
+# For plugin API
+terrust-plugins = { path = "..", version = "0.1.0" }
+
+[features]
+default = []
