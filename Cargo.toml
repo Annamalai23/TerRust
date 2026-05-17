@@ -70,6 +70,7 @@ pathdiff = "0.2"
 # Testing
 criterion = "0.5"
 trycmd = "0.15"
+proptest = "1.4"
 
 # Mocking
 mockall = "0.12"
@@ -101,5 +102,13 @@ all = ["ai", "plugins", "clipboard"]
 ai = ["reqwest", "tokio-stream", "serde_json"]
 plugins = ["libloading"]
 clipboard = ["arboard"]
+
+[[bench]]
+name = "ansi_parser"
+harness = false
+
+[[bench]]
+name = "terminal_grid"
+harness = false
 
 [workspace]

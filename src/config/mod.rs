@@ -522,6 +522,63 @@ impl Config {
     pub fn plugins_dir(&self) -> PathBuf {
         self.plugins.plugin_dir.clone()
     }
+
+    /// Validate configuration values for correctness and safety.
+    /// Returns a list of warnings for non-critical issues.
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        // Check that the shell path exists
+        let shell_path = std::path::Path::new(&self.terminal.shell);
+        if !shell_path.exists() {
+            warnings.push(format!(
+                "Shell '{}' not found at configured path",
+                self.terminal.shell
+            ));
+        }
+
+        // Check that the theme name is recognized
+        let known_themes = ["tokyo-night", "catppuccin-mocha", "dracula", "Tokyo Night", "Catppuccin Mocha", "Dracula"];
+        if !known_themes.contains(&self.general.theme.as_str()) {
+            warnings.push(format!(
+                "Theme '{}' is not a built-in theme. Available: tokyo-night, catppuccin-mocha, dracula",
+                self.general.theme
+            ));
+        }
+
+        // Validate scrollback limit range
+        if self.general.scrollback_limit == 0 {
+            warnings.push("Scrollback limit is 0 — history will be disabled".to_string());
+        } else if self.general.scrollback_limit > 1_000_000 {
+            warnings.push(format!(
+                "Scrollback limit of {} may use excessive memory",
+                self.general.scrollback_limit
+            ));
+        }
+
+        // Validate opacity range
+        if !(0.0..=1.0).contains(&self.general.opacity) {
+            warnings.push(format!(
+                "Opacity {} is out of range (0.0–1.0)",
+                self.general.opacity
+            ));
+        }
+
+        // Validate AI timeout
+        if self.ai.timeout == 0 {
+            warnings.push("AI timeout is 0 — requests may hang indefinitely".to_string());
+        }
+
+        // Validate plugin directory exists
+        if !self.plugins.plugin_dir.exists() {
+            warnings.push(format!(
+                "Plugin directory '{}' does not exist",
+                self.plugins.plugin_dir.display()
+            ));
+        }
+
+        warnings
+    }
 }
 
 #[cfg(test)]

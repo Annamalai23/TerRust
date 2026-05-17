@@ -3,10 +3,8 @@
 //! Defines color schemes and styling for the terminal UI.
 
 use ratatui::style::{Color, Style};
-use ratatui::text::Span;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Theme configuration for TerRust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -553,7 +551,7 @@ impl ThemeConfig {
 
 /// Parse a hex color string into RGB components
 /// Supports formats: #RGB, #RRGGBB, #RRGGBBAA
-fn parse_hex_color(color: &str) -> Result<(u8, u8, u8), ()> {
+pub fn parse_hex_color(color: &str) -> Result<(u8, u8, u8), ()> {
     let clean = color.trim_start_matches('#');
     
     match clean.len() {

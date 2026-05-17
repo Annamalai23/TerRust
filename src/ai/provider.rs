@@ -4,8 +4,7 @@
 //! CLI-based agents (Claude, Ollama) and HTTP-based APIs.
 
 use crate::config::{AIConfig, AIProviderConfig, LocalAIConfig};
-use anyhow::{Context, Result};
-use std::process::Stdio;
+use anyhow::Result;
 use tracing::{debug, error, info};
 
 /// Result of an AI completion
@@ -131,6 +130,7 @@ impl AIProvider for LocalProvider {
 
 /// OpenAI CLI provider
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct OpenAICLIProvider {
     cli_path: String,
     model: String,
@@ -236,6 +236,27 @@ impl AI {
     pub fn provider_name(&self) -> &str {
         self.provider.name()
     }
+
+    /// Send a prompt through the real provider and split the response
+    /// into word-group chunks for streaming-style display.
+    pub fn stream_to_chunks(&self, prompt: &str) -> Result<Vec<String>> {
+        let completion = self.provider.complete(prompt)?;
+        if completion.text.is_empty() {
+            return Ok(vec!["[empty response]".to_string()]);
+        }
+        let words: Vec<&str> = completion.text.split(' ').collect();
+        let mut chunks = Vec::new();
+        for group in words.chunks(3) {
+            let chunk = group.join(" ");
+            if !chunk.is_empty() {
+                chunks.push(chunk);
+            }
+        }
+        if chunks.is_empty() {
+            chunks.push(completion.text);
+        }
+        Ok(chunks)
+    }
 }
 
 #[cfg(test)]
@@ -279,5 +300,71 @@ mod tests {
 
         assert!(providers.contains(&"claude".to_string()));
         assert!(providers.contains(&"local".to_string()));
+    }
+
+    /// Test-only provider that returns a fixed response
+    struct TestProvider {
+        response: String,
+    }
+
+    impl AIProvider for TestProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn complete(&self, _prompt: &str) -> Result<Completion> {
+            Ok(Completion {
+                text: self.response.clone(),
+                provider: "test".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn test_ai_stream_to_chunks_empty_prompt() {
+        let provider = TestProvider {
+            response: "test response".to_string(),
+        };
+        let ai = AI::new(Box::new(provider));
+        let chunks = ai.stream_to_chunks("").unwrap();
+        assert!(!chunks.is_empty(), "Should produce at least one chunk");
+        let combined: String = chunks.join(" ");
+        assert!(combined.contains("test response"), "Combined: {}", combined);
+    }
+
+    #[test]
+    fn test_ai_stream_to_chunks_produces_multiple_chunks() {
+        let provider = TestProvider {
+            response: "hello world this is a test".to_string(),
+        };
+        let ai = AI::new(Box::new(provider));
+        let chunks = ai.stream_to_chunks("anything").unwrap();
+        let combined: String = chunks.join(" ");
+        assert!(combined.contains("hello"), "Response should contain 'hello'");
+        assert!(combined.contains("test"), "Response should contain 'test'");
+        // With chunk size of 3, "hello world this" is one chunk, "is a test" another
+        assert!(chunks.len() >= 2, "Should produce at least 2 chunks, got {}", chunks.len());
+    }
+
+    #[test]
+    fn test_ai_stream_to_chunks_single_word() {
+        let provider = TestProvider {
+            response: "single".to_string(),
+        };
+        let ai = AI::new(Box::new(provider));
+        let chunks = ai.stream_to_chunks("anything").unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "single");
+    }
+
+    #[test]
+    fn test_ai_stream_to_chunks_empty_response() {
+        let provider = TestProvider {
+            response: "".to_string(),
+        };
+        let ai = AI::new(Box::new(provider));
+        let chunks = ai.stream_to_chunks("anything").unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].contains("empty"));
     }
 }

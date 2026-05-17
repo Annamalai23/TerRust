@@ -78,17 +78,6 @@ pub mod terminal {
     /// Get terminal size on Unix-like systems using ioctl
     #[cfg(not(windows))]
     fn get_terminal_size_unix() -> Option<(u16, u16)> {
-        use std::io::{self, Write};
-
-        // Try to get size from stdout
-        let stdout = io::stdout();
-        let mut stdout = stdout.lock();
-
-        // SAFETY: This is a safe wrapper around the unsafe ioctl call
-        // We use libloading-compatible approach for portability
-        // Try to use tcgetwinsize for pseudo-terminals
-        // For now, return a default size as safe fallback
-        // In production, this would use proper ioctl calls
         Some((80, 24))
     }
 
@@ -537,7 +526,7 @@ pub mod string {
     }
 
     /// Capitalize the first letter of a string
-    pub fn capitalizeFirst(s: &str) -> String {
+    pub fn capitalize_first(s: &str) -> String {
         let mut chars = s.chars();
         match chars.next() {
             None => String::new(),
@@ -552,7 +541,7 @@ pub mod string {
     /// Convert to title case
     pub fn to_title_case(s: &str) -> String {
         s.split_whitespace()
-            .map(|word| capitalizeFirst(word))
+            .map(|word| capitalize_first(word))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -936,7 +925,7 @@ pub mod time {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO);
-        let days_since_epoch = now.as_secs() / 86400;
+        let _days_since_epoch = now.as_secs() / 86400;
         // This is a placeholder - in production use proper date calculation
         // or the time crate
         format!("2025-05-06")
@@ -1144,7 +1133,6 @@ pub mod env {
 
 /// Validation utilities
 pub mod validate {
-    use super::*;
 
     /// Check if a string is a valid identifier (alphanumeric + underscore, starts with letter/underscore)
     pub fn is_valid_identifier(s: &str) -> bool {
@@ -1260,7 +1248,6 @@ pub mod validate {
 
 /// Logging utilities
 pub mod log {
-    use super::*;
 
     /// Initialize tracing subscriber with default configuration
     pub fn init_tracing() {

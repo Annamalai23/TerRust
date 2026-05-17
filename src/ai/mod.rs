@@ -8,7 +8,7 @@ pub mod provider;
 pub use provider::{AI, Completion, ProviderFactory};
 
 use crate::config::AIConfig;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::time::Duration;
 
 /// AI client for communicating with AI services
@@ -18,6 +18,7 @@ pub struct AIClient {
     config: AIConfig,
     /// HTTP client for API requests
     #[cfg(feature = "ai")]
+    #[allow(dead_code)]
     http_client: reqwest::Client,
 }
 
@@ -29,7 +30,10 @@ impl AIClient {
         let http_client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
-            .expect("Failed to create HTTP client");
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to create HTTP client with timeout: {}. Using default.", e);
+                reqwest::Client::new()
+            });
 
         Self { config, http_client }
     }
@@ -153,6 +157,25 @@ impl CompletionProvider {
     }
 }
 
+/// Stream a prompt response as chunks of text.
+/// Returns a list of text chunks that can be reassembled into the full response.
+/// This simulates streaming from any provider (mock implementation).
+#[cfg(feature = "ai")]
+pub async fn stream_prompt_text(provider: &str, prompt: &str) -> Vec<String> {
+    // Simulate streaming by splitting the response into sensible chunks
+    let full = format!("[{}] Response to: {}", provider, prompt);
+    let words: Vec<&str> = full.split(' ').collect();
+    let mut chunks = Vec::new();
+    for chunk in words.chunks(2) {
+        chunks.push(chunk.join(" "));
+    }
+    // Ensure at least one chunk
+    if chunks.is_empty() {
+        chunks.push(full);
+    }
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +214,59 @@ mod tests {
             .block_on(client.send_prompt("test"));
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "ai")]
+    async fn test_stream_prompt_text() {
+        let chunks = stream_prompt_text("mock", "hello world").await;
+        assert!(!chunks.is_empty(), "Should produce at least one chunk");
+        let full: String = chunks.join(" ");
+        assert!(full.contains("hello world"), "Response should contain prompt");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "ai")]
+    async fn test_stream_prompt_text_empty_prompt() {
+        let chunks = stream_prompt_text("test", "").await;
+        assert!(!chunks.is_empty(), "Should produce at least one chunk for empty prompt");
+    }
+
+    #[test]
+    #[cfg(feature = "ai")]
+    fn test_chunk_reassembly() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let chunks = rt.block_on(stream_prompt_text("claude", "explain rust"));
+        let combined = chunks.join(" ");
+        assert!(combined.starts_with("[claude]"), "Should start with provider tag");
+        assert!(combined.contains("rust"), "Should contain the prompt");
+    }
+
+    /// Test that AiStreamChunk events can be processed by the app handler
+    #[test]
+    #[cfg(feature = "ai")]
+    fn test_ai_stream_chunk_event_creation() {
+        let id = uuid::Uuid::new_v4();
+        let event = crate::app::AppEvent::AiStreamChunk("hello".to_string(), id);
+        match event {
+            crate::app::AppEvent::AiStreamChunk(text, uuid) => {
+                assert_eq!(text, "hello");
+                assert_eq!(uuid, id);
+            }
+            _ => panic!("Wrong event type"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "ai")]
+    fn test_ai_stream_done_event_creation() {
+        let id = uuid::Uuid::new_v4();
+        let event = crate::app::AppEvent::AiStreamDone(id);
+        match event {
+            crate::app::AppEvent::AiStreamDone(uuid) => {
+                assert_eq!(uuid, id);
+            }
+            _ => panic!("Wrong event type"),
+        }
     }
 }

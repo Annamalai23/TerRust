@@ -7,6 +7,7 @@ pub mod blocks;
 pub mod components;
 pub mod input;
 pub mod render;
+pub mod search;
 
 pub use blocks::{Block, BlockManager, BlockType};
 pub use components::{Alignment, Component, Layout};

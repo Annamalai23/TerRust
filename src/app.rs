@@ -9,20 +9,35 @@
 use crate::config::Config;
 use crate::terminal::Terminal;
 use crate::ui::{BlockManager, InputBar};
+use crate::ui::search::SearchEngine;
 #[cfg(feature = "ai")]
 use crate::ai::AI;
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, terminal};
+use libc::{self};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal as RatatuiTerminal;
-use std::io::stdout;
+use std::io::{stdout, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
+
+/// Install a panic hook that restores terminal state on panics.
+/// Prevents leaving the terminal in raw mode / alternate screen.
+fn install_terminal_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort restore terminal to a usable state
+        let _ = crossterm::terminal::disable_raw_mode();
+        // Use raw escape sequences: show cursor, disable mouse, leave alt screen
+        write!(std::io::stderr(), "\x1B[?25h\x1B[?1000l\x1B[?1002l\x1B[?1049l").ok();
+        prev(info);
+    }));
+}
 
 /// Application state structure
 pub struct App {
@@ -52,6 +67,7 @@ pub struct App {
     /// Plugin directory
     plugin_dir: Option<PathBuf>,
     /// Event sender for background tasks
+    #[allow(dead_code)]
     event_sender: Option<Sender<AppEvent>>,
     /// Event receiver
     event_receiver: Receiver<AppEvent>,
@@ -61,6 +77,16 @@ pub struct App {
     scroll_offset: usize,
     /// Whether terminal scroll mode is active
     scroll_mode: bool,
+    /// Whether search mode is active
+    search_mode: bool,
+    /// Search engine for scrollback search
+    search_engine: SearchEngine,
+    /// Whether selection mode is active
+    selection_active: bool,
+    /// Selection anchor (line, col, block_offset) when selection started
+    selection_anchor: Option<(usize, usize, usize)>,
+    /// Selection end point (line, col, block_offset)
+    selection_end: Option<(usize, usize, usize)>,
 }
 
 /// Application events
@@ -80,6 +106,10 @@ pub enum AppEvent {
     TerminalOutput(Vec<u8>),
     /// Child process exited
     ChildExited(i32),
+    /// Chunk of streaming AI response
+    AiStreamChunk(String, Uuid),
+    /// Streaming AI response complete
+    AiStreamDone(Uuid),
 }
 
 impl App {
@@ -138,12 +168,20 @@ impl App {
             running: false,
             scroll_offset: 0,
             scroll_mode: false,
+            search_mode: false,
+            search_engine: SearchEngine::new(),
+            selection_active: false,
+            selection_anchor: None,
+            selection_end: None,
         })
     }
 
     /// Run the main application event loop
     pub async fn run(&mut self) -> Result<()> {
         info!("Starting main event loop");
+
+        // Install panic hook that restores terminal state on crashes
+        install_terminal_panic_hook();
 
         // Initialize terminal
         self.initialize_terminal()?;
@@ -152,6 +190,9 @@ impl App {
         let mut stdout = stdout();
         execute!(stdout, terminal::EnterAlternateScreen)?;
         enable_raw_mode()?;
+
+        // Enable mouse capture for scrolling and selection
+        let _ = execute!(stdout, crossterm::event::EnableMouseCapture);
 
         let backend = CrosstermBackend::new(stdout);
         let mut ratatui_terminal = RatatuiTerminal::new(backend)?;
@@ -175,6 +216,9 @@ impl App {
                     }
                     Event::Paste(text) => {
                         self.handle_event(AppEvent::Paste(text), &mut ratatui_terminal)?
+                    }
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse(mouse.column, mouse.kind)?;
                     }
                     _ => {}
                 }
@@ -222,40 +266,63 @@ impl App {
         Ok(())
     }
 
-    /// Start PTY reader thread
+    /// Start PTY reader thread that reads data from the shell
+    /// and sends it through the event channel for processing.
     fn start_pty_reader(&mut self) -> Result<()> {
+        let term = self.terminal.as_ref().context("Terminal not initialized")?;
+        let fd = term.pty_master();
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 {
+            return Err(anyhow::anyhow!("Failed to duplicate PTY fd: {}", std::io::Error::last_os_error()));
+        }
+        let sender = self.event_sender.clone()
+            .ok_or_else(|| anyhow::anyhow!("No event sender available"))?;
+
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = unsafe { libc::read(dup_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n > 0 {
+                    if sender.send(AppEvent::TerminalOutput(buf[..n as usize].to_vec())).is_err() {
+                        break;
+                    }
+                } else if n == 0 {
+                    break;
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+            }
+            unsafe { libc::close(dup_fd); }
+        });
+
+        info!("PTY reader thread started");
         Ok(())
     }
 
-/// Process terminal output
+/// Process terminal output and sync UI state
     fn process_terminal_output(
         &mut self,
-        terminal: &mut RatatuiTerminal<CrosstermBackend<std::io::Stdout>>,
+        _terminal: &mut RatatuiTerminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
-        let content = if let Some(ref mut term) = self.terminal {
-            let data = term.read_nonblocking()?;
-            let content = if !data.is_empty() {
-                term.process_data(&data)?;
-                Some(term.grid.cells.clone())
-            } else {
-                None
-            };
-            
-            // Check for child exit and capture exit code
+        // Note: raw PTY reading is now done in the reader thread.
+        // This method only handles UI sync and command lifecycle.
+        let content = self.terminal.as_ref().map(|term| term.grid.cells.clone());
+
+        // Check for child exit
+        if let Some(ref mut term) = self.terminal {
             let exit_code = term.get_exit_code();
             let child_alive = term.is_child_alive();
             if !child_alive {
-                // Child exited - capture exit code and duration
                 self.capture_command_completion(exit_code.unwrap_or(-1));
                 self.running = false;
             }
-            content
-        } else {
-            None
-        };
+        }
 
         if let Some(content) = content {
-            // Check for prompt return (command completion)
             self.check_command_completion(&content);
             self.sync_terminal_output_block(content);
         }
@@ -356,6 +423,12 @@ impl App {
             AppEvent::ChildExited(code) => {
                 self.handle_child_exited(code)?;
             }
+            AppEvent::AiStreamChunk(text, block_id) => {
+                self.handle_ai_stream_chunk(text, block_id)?;
+            }
+            AppEvent::AiStreamDone(block_id) => {
+                self.handle_ai_stream_done(block_id)?;
+            }
         }
         Ok(())
     }
@@ -369,7 +442,34 @@ impl App {
     ) -> Result<()> {
         trace!("Key pressed: {:?} with modifiers {:?}", key, mods);
 
-        // Handle input bar keys first
+        // Handle search mode keys first
+        if self.search_mode {
+            match (key, mods) {
+                (KeyCode::Esc, _) => {
+                    self.search_mode = false;
+                    self.search_engine.reset();
+                    self.input_bar.set_prompt("$ ");
+                    self.input_bar.clear();
+                    trace!("Exited search mode");
+                }
+                (KeyCode::Enter, KeyModifiers::SHIFT) => {
+                    self.search_engine.prev_match();
+                }
+                (KeyCode::Enter, _) => {
+                    self.search_engine.next_match();
+                }
+                _ => {
+                    let handled = self.input_bar.handle_key(key, mods);
+                    if handled {
+                        let query = self.input_bar.get_content().clone();
+                        self.search_engine.set_query(&query, &self.block_manager);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Handle input bar keys first (but not in search mode or selection mode)
         let handled = self.input_bar.handle_key(key, mods);
         if handled {
             // Check if we should execute
@@ -417,6 +517,17 @@ impl App {
 
         // Handle global keys
         match (key, mods) {
+            // Search mode: Ctrl+F
+            (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                self.search_mode = true;
+                self.input_bar.set_prompt("Search: ");
+                self.input_bar.clear();
+                info!("Entered search mode");
+            }
+            // Copy selection: Ctrl+Shift+C
+            (KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
+                self.copy_selection()?;
+            }
             // AI mode: / to enter, Escape to cancel
             (KeyCode::Char('/'), _) if self.ai_enabled => {
                 self.ai_mode = true;
@@ -424,7 +535,19 @@ impl App {
                 info!("Entered AI mode");
             }
             (KeyCode::Esc, _) => {
-                if self.ai_mode {
+                if self.search_mode {
+                    self.search_mode = false;
+                    self.search_engine.reset();
+                    self.input_bar.set_prompt("$ ");
+                    self.input_bar.clear();
+                } else if self.scroll_mode {
+                    self.scroll_offset = 0;
+                    self.scroll_mode = false;
+                    self.selection_active = false;
+                    self.selection_anchor = None;
+                    self.selection_end = None;
+                    trace!("Exited scroll mode");
+                } else if self.ai_mode {
                     self.ai_mode = false;
                     self.input_bar.set_prompt("$ ");
                     self.input_bar.cancel();
@@ -465,57 +588,127 @@ impl App {
                 }
                 trace!("Scroll down 1: offset={}", self.scroll_offset);
             }
-            // Exit scroll mode with Escape
-            (KeyCode::Esc, _) if self.scroll_mode => {
-                self.scroll_offset = 0;
-                self.scroll_mode = false;
-                trace!("Exited scroll mode");
-            }
             _ => {
                 trace!("Unhandled key: {:?}", key);
             }
         }
 
-        // Handle AI mode submission
+        // Handle AI mode submission (streaming)
         if self.ai_mode && key == KeyCode::Enter {
             let prompt = self.input_bar.get_content().clone();
-            if !prompt.is_empty() && self.ai_client.is_some() {
-                // Call AI synchronously (blocking but that's OK for now)
-                let ai = self.ai_client.as_ref().unwrap();
-                match ai.ask(&prompt) {
-                    Ok(response) => {
-                        info!("AI response: {} chars", response.text.len());
-                        // Convert response to cells for the block
-                        let content: Vec<Vec<crate::terminal::Cell>> = response.text
-                            .lines()
-                            .map(|line| {
-                                line.chars()
-                                    .map(|c| crate::terminal::Cell {
-                                        character: c,
-                                        foreground: None,
-                                        background: None,
-                                        attributes: crate::terminal::Attributes::default(),
-                                    })
-                                    .collect()
-                            })
-                            .collect();
-                        
-                        let ai_block = self.block_manager.add_ai_block();
-                        if let Some(block) = self.block_manager.get_block_mut(ai_block) {
-                            block.title = Some("AI Response".to_string());
-                            block.content = content;
-                            block.height = block.content.len() as u16;
+            if !prompt.is_empty() {
+                let ai_block = self.block_manager.add_ai_block();
+                if let Some(block) = self.block_manager.get_block_mut(ai_block) {
+                    block.title = Some("AI Streaming...".to_string());
+                }
+
+                #[cfg(feature = "ai")]
+                if let Some(ai) = self.ai_client.as_ref() {
+                    let chunks = ai.stream_to_chunks(&prompt).unwrap_or_else(|e| {
+                        vec![format!("[AI Error: {}]", e)]
+                    });
+                    let sender = self.event_sender.clone();
+                    let id = ai_block;
+                    tokio::task::spawn(async move {
+                        for chunk in chunks {
+                            if sender.as_ref()
+                                .map(|s| s.send(AppEvent::AiStreamChunk(chunk, id)))
+                                .is_none()
+                            {
+                                break;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        error!("AI error: {}", e);
-                    }
+                        let _ = sender.map(|s| s.send(AppEvent::AiStreamDone(id)));
+                    });
+                }
+
+                #[cfg(not(feature = "ai"))]
+                {
+                    let _ = &prompt; // suppress unused
                 }
             }
             self.ai_mode = false;
             self.input_bar.set_prompt("$ ");
             self.input_bar.clear();
         }
+
+        Ok(())
+    }
+
+    /// Copy selected text to clipboard
+    fn copy_selection(&mut self) -> Result<()> {
+        if !self.selection_active {
+            return Ok(());
+        }
+
+        let (anchor, end) = match (self.selection_anchor, self.selection_end) {
+            (Some(a), Some(e)) => (a, e),
+            _ => return Ok(()),
+        };
+
+        let (start, end) = if (anchor.0, anchor.1) <= (end.0, end.1) {
+            (anchor, end)
+        } else {
+            (end, anchor)
+        };
+
+        let mut selected_text = String::new();
+        if let Some(term) = self.terminal.as_ref() {
+            let all_lines: Vec<&[crate::terminal::Cell]> = term
+                .scrollback
+                .iter_rev()
+                .map(|v| v.as_slice())
+                .chain(term.grid.cells.iter().map(|v| v.as_slice()))
+                .collect();
+
+            for (line_idx, row) in all_lines.iter().enumerate() {
+                if line_idx < start.0 {
+                    continue;
+                }
+                if line_idx > end.0 {
+                    break;
+                }
+
+                if line_idx == start.0 && line_idx == end.0 {
+                    let s: String = row[start.1..=end.1.min(row.len().saturating_sub(1))]
+                        .iter()
+                        .map(|c| c.character)
+                        .collect();
+                    selected_text.push_str(&s);
+                } else if line_idx == start.0 {
+                    let s: String = row[start.1..]
+                        .iter()
+                        .map(|c| c.character)
+                        .collect();
+                    selected_text.push_str(&s);
+                    selected_text.push('\n');
+                } else if line_idx == end.0 {
+                    let s: String = row[..=end.1.min(row.len().saturating_sub(1))]
+                        .iter()
+                        .map(|c| c.character)
+                        .collect();
+                    selected_text.push_str(&s);
+                } else {
+                    let s: String = row.iter().map(|c| c.character).collect();
+                    selected_text.push_str(&s.trim_end());
+                    selected_text.push('\n');
+                }
+            }
+        }
+
+        if !selected_text.is_empty() {
+            #[cfg(feature = "clipboard")]
+            {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(selected_text.clone());
+                }
+            }
+            info!("Copied {} chars to clipboard", selected_text.len());
+        }
+
+        self.selection_active = false;
+        self.selection_anchor = None;
+        self.selection_end = None;
 
         Ok(())
     }
@@ -533,6 +726,26 @@ impl App {
     fn handle_paste(&mut self, text: &str) -> Result<()> {
         debug!("Paste: {}", text);
         self.input_bar.insert_str(text);
+        Ok(())
+    }
+
+    /// Handle mouse events for scrolling and selection
+    fn handle_mouse(&mut self, _col: u16, kind: MouseEventKind) -> Result<()> {
+        match kind {
+            MouseEventKind::ScrollDown => {
+                if self.scroll_offset > 0 {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                    if self.scroll_offset == 0 {
+                        self.scroll_mode = false;
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll_mode = true;
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -555,7 +768,43 @@ impl App {
     /// Handle child process exit
     fn handle_child_exited(&mut self, code: i32) -> Result<()> {
         warn!("Child process exited with code: {}", code);
-        // Would trigger restart or notification
+        Ok(())
+    }
+
+    /// Handle a streaming AI response chunk: append text to the AI block
+    fn handle_ai_stream_chunk(&mut self, text: String, block_id: Uuid) -> Result<()> {
+        if let Some(block) = self.block_manager.get_block_mut(block_id) {
+            for c in text.chars() {
+                if c == '\n' {
+                    block.content.push(Vec::new());
+                } else if let Some(last_row) = block.content.last_mut() {
+                    last_row.push(crate::terminal::Cell {
+                        character: c,
+                        foreground: None,
+                        background: None,
+                        attributes: crate::terminal::Attributes::default(),
+                    });
+                } else {
+                    block.content.push(vec![crate::terminal::Cell {
+                        character: c,
+                        foreground: None,
+                        background: None,
+                        attributes: crate::terminal::Attributes::default(),
+                    }]);
+                }
+            }
+            if !block.content.is_empty() {
+                block.height = block.content.len() as u16;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalize a streaming AI response, updating the block title
+    fn handle_ai_stream_done(&mut self, block_id: Uuid) -> Result<()> {
+        if let Some(block) = self.block_manager.get_block_mut(block_id) {
+            block.title = Some("AI Response".to_string());
+        }
         Ok(())
     }
 
@@ -565,7 +814,7 @@ impl App {
         terminal: &mut RatatuiTerminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         terminal.draw(|f| {
-            use crate::ui::render::{blocks_to_lines, grid_to_lines};
+            use crate::ui::render::{blocks_to_lines, cells_to_line_with_search, grid_to_lines, render_scrollbar_line};
             use ratatui::layout::{Constraint, Direction, Layout};
             use ratatui::style::Style;
             use ratatui::text::{Line, Span};
@@ -587,6 +836,10 @@ impl App {
                 .constraints([Constraint::Min(1), Constraint::Length(3)])
                 .split(f.size());
 
+            let search_matches = self.search_engine.matches().to_vec();
+            let current_match = self.search_engine.current_match();
+            let has_search = self.search_mode && self.search_engine.has_matches();
+
             let mut output_lines = if self.scroll_offset > 0 {
                 // Scroll mode: show scrollback + current grid
                 let mut lines = Vec::new();
@@ -596,10 +849,22 @@ impl App {
                         if idx >= self.scroll_offset {
                             break;
                         }
-                        lines.push(crate::ui::render::cells_to_line(line, fg));
+                        if has_search {
+                            lines.push(cells_to_line_with_search(line, fg, idx, &search_matches, current_match));
+                        } else {
+                            lines.push(crate::ui::render::cells_to_line(line, fg));
+                        }
                     }
                     // Add current grid
-                    lines.extend(grid_to_lines(&term.grid, &self.config.theme));
+                    let grid_lines = if has_search {
+                        let offset = term.scrollback.len();
+                        term.grid.cells.iter().enumerate().map(|(idx, row)| {
+                            cells_to_line_with_search(row, fg, offset + idx, &search_matches, current_match)
+                        }).collect::<Vec<_>>()
+                    } else {
+                        grid_to_lines(&term.grid, &self.config.theme)
+                    };
+                    lines.extend(grid_lines);
                 }
                 // Reverse to show oldest at top
                 lines.reverse();
@@ -613,15 +878,62 @@ impl App {
                 blocks_to_lines(&self.block_manager, &self.config.theme, chunks[0].width)
             };
 
+            // Pad output lines to at least visible_height for scrollbar calculation
             let visible_height = chunks[0].height.saturating_sub(2) as usize;
+            let total_content_lines = if self.scroll_offset > 0 {
+                let sb_len = self.terminal.as_ref().map(|t| t.scrollback.len()).unwrap_or(0);
+                let grid_len = self.terminal.as_ref().map(|t| t.grid.cells.len()).unwrap_or(0);
+                sb_len + grid_len
+            } else {
+                output_lines.len()
+            };
+
+            // Add scrollbar if in scroll mode
+            if self.scroll_mode && self.scroll_offset > 0 && visible_height > 0 {
+                let _scrollbar = render_scrollbar_line(
+                    chunks[0].width,
+                    total_content_lines,
+                    visible_height,
+                    self.scroll_offset,
+                );
+                if output_lines.len() < visible_height {
+                    let pad = visible_height - output_lines.len();
+                    output_lines.extend(std::iter::repeat(Line::from(String::new())).take(pad));
+                }
+                // Add scrollbar as the last visible line
+                if !output_lines.is_empty() {
+                    let last = output_lines.len() - 1;
+                    if last < output_lines.len() {
+                        output_lines[last] = Line::from(Span::styled(
+                            format!("{:width$}", "▐", width = chunks[0].width as usize),
+                            Style::default().fg(ratatui::style::Color::DarkGray),
+                        ));
+                    }
+                }
+            }
+
             if visible_height > 0 && output_lines.len() > visible_height {
                 output_lines = output_lines.split_off(output_lines.len() - visible_height);
             }
 
-            let title = if self.scroll_mode && self.scroll_offset > 0 {
-                format!("TerRust [Scroll: {} lines]", self.scroll_offset)
+            let title = if self.search_mode {
+                if self.search_engine.has_matches() {
+                    format!(
+                        " TerRust | Search: \"{}\" — {}/{} matches ",
+                        self.search_engine.query(),
+                        self.search_engine.current_match() + 1,
+                        self.search_engine.total_matches(),
+                    )
+                } else {
+                    format!(
+                        " TerRust | Search: \"{}\" (no matches) ",
+                        self.search_engine.query(),
+                    )
+                }
+            } else if self.scroll_mode && self.scroll_offset > 0 {
+                format!(" TerRust [Scroll: {} lines] ", self.scroll_offset)
             } else {
-                "TerRust".to_string()
+                " TerRust ".to_string()
             };
 
             let output_paragraph = Paragraph::new(output_lines)
@@ -638,8 +950,15 @@ impl App {
 
             // Draw input bar
             let input_content = self.input_bar.get_content();
+            let input_prompt = self.input_bar.prompt.clone();
+            let input_display = if self.search_mode {
+                format!("{}{}", input_prompt, input_content)
+            } else {
+                input_content.to_string()
+            };
+
             let input_span = Span::styled(
-                input_content.to_string(),
+                input_display.clone(),
                 ratatui::style::Style::default().fg(fg),
             );
 
@@ -656,7 +975,7 @@ impl App {
 
             // Draw cursor if input is active
             if self.input_bar.is_active() {
-                let cursor_x = input_content.len() as u16;
+                let cursor_x = input_display.len() as u16;
                 f.set_cursor(input_area.x + 1 + cursor_x, input_area.y + 1);
             }
         })?;
@@ -676,6 +995,7 @@ impl App {
 
         // Restore terminal state
         disable_raw_mode()?;
+        let _ = execute!(terminal.backend_mut(), crossterm::event::DisableMouseCapture);
         execute!(terminal.backend_mut(), terminal::LeaveAlternateScreen)?;
         terminal.show_cursor()?;
 
@@ -732,6 +1052,11 @@ impl Clone for App {
             running: self.running,
             scroll_offset: self.scroll_offset,
             scroll_mode: self.scroll_mode,
+            search_mode: self.search_mode,
+            search_engine: self.search_engine.clone(),
+            selection_active: self.selection_active,
+            selection_anchor: self.selection_anchor,
+            selection_end: self.selection_end,
         }
     }
 }

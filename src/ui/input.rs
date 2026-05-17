@@ -366,7 +366,7 @@ impl InputBar {
         }
 
         let search_term = self.input.clone();
-        let current_index = self.history_index.unwrap();
+        let current_index = self.history_index.unwrap_or(self.history.len());
 
         for i in (0..self.history.len()).rev() {
             if i >= current_index {

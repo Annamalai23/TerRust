@@ -183,6 +183,7 @@ pub struct BlockManager {
     blocks: Vec<Block>,
     current_block: Option<Uuid>,
     max_blocks: usize,
+    #[allow(dead_code)]
     scrollback_limit: usize,
 }
 
@@ -576,7 +577,7 @@ mod tests {
     fn test_block_manager_navigation() {
         let mut manager = BlockManager::new(100, 1000);
         let id1 = manager.add_block(Block::new(BlockType::Output));
-        let id2 = manager.add_block(Block::new(BlockType::Output));
+        let _id2 = manager.add_block(Block::new(BlockType::Output));
         let id3 = manager.add_block(Block::new(BlockType::Output));
 
         assert_eq!(manager.current_block, Some(id3));

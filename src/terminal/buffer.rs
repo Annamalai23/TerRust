@@ -186,4 +186,14 @@ impl ScrollbackBuffer {
     pub fn iter_rev(&self) -> impl Iterator<Item = &Vec<Cell>> {
         self.lines.iter().rev()
     }
+
+    /// Remove and return the oldest line from the front of the buffer.
+    /// Returns `None` if the buffer is empty.
+    pub fn pop_front(&mut self) -> Option<Vec<Cell>> {
+        if self.lines.is_empty() {
+            None
+        } else {
+            Some(self.lines.remove(0))
+        }
+    }
 }

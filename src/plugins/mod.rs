@@ -93,11 +93,11 @@ impl PluginManager {
     /// Try to load plugin info from a dynamic library
     #[cfg(feature = "plugins")]
     fn load_plugin_from_library(&self, path: &Path) -> Result<Option<PluginInfo>> {
-        use libloading::{Library, Symbol};
+        use libloading::Library;
 
         // Try to load the library
         match unsafe { Library::new(path) } {
-            Ok(library) => {
+            Ok(_library) => {
                 // Try to get plugin info function
                 // Convention: plugins should export a `plugin_info` function
                 // that returns a pointer to PluginInfo

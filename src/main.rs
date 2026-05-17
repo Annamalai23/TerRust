@@ -3,20 +3,9 @@
 //! A fast, native, CLI application built in Rust that combines traditional terminal
 //! workflows with AI assistance and visual enhancements.
 
-mod app;
-mod config;
-mod history;
-mod plugins;
-mod terminal;
-mod ui;
-mod utils;
-
-#[cfg(feature = "ai")]
-mod ai;
-
 use anyhow::{Context, Result};
-use clap::Parser;
-use config::Config;
+use clap::{Parser, Subcommand};
+use terrust::config::Config;
 use std::path::PathBuf;
 use tracing::{error, info};
 
@@ -55,6 +44,42 @@ struct Args {
     /// Plugin directory
     #[arg(long, value_name = "DIR")]
     plugin_dir: Option<PathBuf>,
+
+    /// Optional subcommand (theme management, etc.)
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Theme management commands
+    Theme {
+        #[command(subcommand)]
+        action: ThemeAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ThemeAction {
+    /// List available themes (built-in and user themes)
+    List,
+    /// Preview a theme's colors in the terminal
+    Preview {
+        /// Theme name (e.g. "tokyo-night", "dracula")
+        name: String,
+    },
+    /// Show a theme's full configuration as TOML
+    Show {
+        /// Theme name
+        name: String,
+    },
+    /// Edit a single field in a theme and save to user themes directory
+    Edit {
+        /// Theme name
+        name: String,
+        /// Key=value pair, e.g. background=#ff0000
+        key_value: String,
+    },
 }
 
 #[tokio::main]
@@ -85,14 +110,32 @@ async fn main() -> Result<()> {
         Config::default()
     };
 
+    // Validate configuration
+    for warning in config.validate() {
+        info!("Config warning: {}", warning);
+    }
+
     // Override config with command line arguments
     if let Some(shell) = args.shell {
         config.terminal.shell = shell;
     }
 
+    // Handle subcommands (theme management, etc.)
+    if let Some(cmd) = args.command {
+        match cmd {
+            Commands::Theme { action } => match action {
+                ThemeAction::List => terrust::cli::list_themes()?,
+                ThemeAction::Preview { name } => terrust::cli::preview_theme(&name)?,
+                ThemeAction::Show { name } => terrust::cli::show_theme(&name)?,
+                ThemeAction::Edit { name, key_value } => terrust::cli::edit_theme(&name, &key_value)?,
+            },
+        }
+        return Ok(());
+    }
+
     // List plugins and exit if requested
     if args.list_plugins {
-        let plugin_manager = plugins::PluginManager::new(
+        let plugin_manager = terrust::plugins::PluginManager::new(
             args.plugin_dir.clone().unwrap_or_else(|| config.plugins.plugin_dir.clone()),
         );
         let plugins = plugin_manager.list_plugins()?;
@@ -104,7 +147,7 @@ async fn main() -> Result<()> {
     }
 
     // Initialize and run the application
-    let result = app::App::new(config, args.no_ai, args.fullscreen, args.plugin_dir)
+    let result = terrust::app::App::new(config, args.no_ai, args.fullscreen, args.plugin_dir)
         .with_context(|| "Failed to initialize application")?
         .run()
         .await;
@@ -121,6 +164,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn test_args_parsing() {
@@ -128,6 +172,7 @@ mod tests {
         assert!(!args.no_ai);
         assert!(!args.fullscreen);
         assert!(!args.verbose);
+        assert!(args.command.is_none());
     }
 
     #[test]
@@ -142,5 +187,56 @@ mod tests {
     fn test_args_with_shell() {
         let args = Args::parse_from(["terrust", "-s", "zsh"]);
         assert_eq!(args.shell, Some("zsh".to_string()));
+    }
+
+    #[test]
+    fn test_theme_list_subcommand() {
+        let args = Args::parse_from(["terrust", "theme", "list"]);
+        let cmd = args.command.unwrap();
+        match cmd {
+            Commands::Theme { action } => match action {
+                ThemeAction::List => {} // expected
+                _ => panic!("Expected List action"),
+            },
+        }
+    }
+
+    #[test]
+    fn test_theme_preview_subcommand() {
+        let args = Args::parse_from(["terrust", "theme", "preview", "tokyo-night"]);
+        let cmd = args.command.unwrap();
+        match cmd {
+            Commands::Theme { action } => match action {
+                ThemeAction::Preview { name } => assert_eq!(name, "tokyo-night"),
+                _ => panic!("Expected Preview action"),
+            },
+        }
+    }
+
+    #[test]
+    fn test_theme_show_subcommand() {
+        let args = Args::parse_from(["terrust", "theme", "show", "dracula"]);
+        let cmd = args.command.unwrap();
+        match cmd {
+            Commands::Theme { action } => match action {
+                ThemeAction::Show { name } => assert_eq!(name, "dracula"),
+                _ => panic!("Expected Show action"),
+            },
+        }
+    }
+
+    #[test]
+    fn test_theme_edit_subcommand() {
+        let args = Args::parse_from(["terrust", "theme", "edit", "my-theme", "background=#000000"]);
+        let cmd = args.command.unwrap();
+        match cmd {
+            Commands::Theme { action } => match action {
+                ThemeAction::Edit { name, key_value } => {
+                    assert_eq!(name, "my-theme");
+                    assert_eq!(key_value, "background=#000000");
+                }
+                _ => panic!("Expected Edit action"),
+            },
+        }
     }
 }
